@@ -25,6 +25,7 @@ class Template:
         self.spell_name = spell_name
         self.is_closed = is_closed
         self.points = UnistrokeRecognizer.normalize_points(raw_points)
+        self.points_xy = UnistrokeRecognizer.to_array(self.points)
 
 
 class UnistrokeRecognizer:
@@ -295,6 +296,52 @@ class UnistrokeRecognizer:
 
         return min(f1, f2)
 
+    @staticmethod
+    def to_array(points):
+        """แปลงรายการ Point เป็นอาร์เรย์ NumPy ขนาด (N, 2) สำหรับการคำนวณแบบเวกเตอร์"""
+        return np.array([(p.x, p.y) for p in points], dtype=np.float64)
+
+    def _batch_distance_at_best_angle(self, candidates, template_xy):
+        """
+        Golden Section Search แบบเดียวกับ _distance_at_best_angle แต่ประมวลผลลายเส้นหลายชุดพร้อมกัน
+        candidates: อาร์เรย์ (B, N, 2) ของลายเส้นที่เลื่อนจุดเริ่มต้นแล้ว, Return: ระยะห่างที่ดีที่สุด (B,)
+        """
+        center = candidates.mean(axis=1, keepdims=True)
+        dx = candidates[:, :, 0] - center[:, :, 0]
+        dy = candidates[:, :, 1] - center[:, :, 1]
+        cx = center[:, :, 0]
+        cy = center[:, :, 1]
+        tx = template_xy[:, 0]
+        ty = template_xy[:, 1]
+
+        def distance(angles):
+            cos_val = np.cos(angles)[:, np.newaxis]
+            sin_val = np.sin(angles)[:, np.newaxis]
+            rx = dx * cos_val - dy * sin_val + cx
+            ry = dx * sin_val + dy * cos_val + cy
+            return np.hypot(rx - tx, ry - ty).mean(axis=1)
+
+        a = np.full(len(candidates), -self.MAX_ROTATION_RAD)
+        b = np.full(len(candidates), self.MAX_ROTATION_RAD)
+        threshold = math.radians(2.0)
+
+        x1 = self.PHI * a + (1 - self.PHI) * b
+        f1 = distance(x1)
+        x2 = (1 - self.PHI) * a + self.PHI * b
+        f2 = distance(x2)
+
+        while np.max(np.abs(b - a)) > threshold:
+            go_left = f1 < f2
+            b = np.where(go_left, x2, b)
+            a = np.where(go_left, a, x1)
+            x_new = np.where(go_left, self.PHI * a + (1 - self.PHI) * b, (1 - self.PHI) * a + self.PHI * b)
+            f_new = distance(x_new)
+
+            x1, x2 = np.where(go_left, x_new, x2), np.where(go_left, x1, x_new)
+            f1, f2 = np.where(go_left, f_new, f1), np.where(go_left, f1, f_new)
+
+        return np.minimum(f1, f2)
+
     def recognize(self, raw_points):
         """
         ประมวลผลลายเส้นของผู้ใช้เพื่อจำแนกเป็นสัญลักษณ์เวทมนตร์
@@ -335,6 +382,10 @@ class UnistrokeRecognizer:
         best_dist = float("inf")
         best_template = None
 
+        fwd_xy = self.to_array(candidate_fwd)
+        rev_xy = self.to_array(candidate_rev)
+        point_idx = np.arange(len(candidate_fwd))
+
         # เปรียบเทียบลายเส้นกับชุดแม่แบบทั้งหมด
         for t in self.templates:
             if is_user_stroke_closed and not t.is_closed:
@@ -353,22 +404,20 @@ class UnistrokeRecognizer:
                 continue
 
             # วนทดสอบการเลื่อนจุดเริ่มต้น (Cyclic Shift) สำหรับรูปทรงปิด
-            shifts = range(0, 64, 2) if t.is_closed else [0]
+            shifts = np.arange(0, 64, 2) if t.is_closed else np.array([0])
 
-            for s in shifts:
-                shifted_fwd = candidate_fwd[s:] + candidate_fwd[:s]
-                shifted_rev = candidate_rev[s:] + candidate_rev[:s]
+            # ทดสอบทุกจุดเริ่มต้นและทั้งสองทิศทางการวาดพร้อมกันในชุดเดียว (Vectorized)
+            shift_idx = (point_idx[np.newaxis, :] + shifts[:, np.newaxis]) % len(point_idx)
+            candidates = np.concatenate([fwd_xy[shift_idx], rev_xy[shift_idx]], axis=0)
+            dists = self._batch_distance_at_best_angle(candidates, t.points_xy)
+            d_min = float(np.minimum(dists[:len(shifts)], dists[len(shifts):]).min())
 
-                d_fwd = self._distance_at_best_angle(shifted_fwd, t.points)
-                d_rev = self._distance_at_best_angle(shifted_rev, t.points)
-                d_min = min(d_fwd, d_rev)
+            if t.name == "Square" and is_square_by_corners:
+                d_min *= 0.70
 
-                if t.name == "Square" and is_square_by_corners:
-                    d_min *= 0.70
-
-                if d_min < best_dist:
-                    best_dist = d_min
-                    best_template = t
+            if d_min < best_dist:
+                best_dist = d_min
+                best_template = t
 
         score = max(0.0, min(1.0, 1.0 - (best_dist / self.HALF_DIAGONAL)))
 

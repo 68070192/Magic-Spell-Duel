@@ -22,6 +22,77 @@ except ImportError:
 
 
 # ==============================================================================
+# 0. ฟังก์ชันเบลนด์สไปรต์ความเร็วสูง (Fast Sprite Blitting Helpers)
+# ==============================================================================
+
+_premult_cache = {}
+
+
+def _get_premultiplied(img):
+    """คืนค่าภาพ BGR ที่คูณ Alpha ไว้ล่วงหน้า (Premultiplied) โดยคำนวณครั้งเดียวต่อสไปรต์ต้นฉบับ"""
+    entry = _premult_cache.get(id(img))
+    if entry is None or entry[0] is not img:
+        if img.shape[2] == 4:
+            alpha = img[:, :, 3:4].astype(np.uint16)
+            premult = ((img[:, :, :3].astype(np.uint16) * alpha + 127) // 255).astype(np.uint8)
+        else:
+            premult = np.ascontiguousarray(img[:, :, :3])
+        entry = (img, premult)
+        _premult_cache[id(img)] = entry
+    return entry[1]
+
+
+def _warp_sprite(img, size, angle, crop):
+    """
+    ย่อ/ขยายสไปรต์เป็น size x size พร้อมหมุน แล้วตัดเฉพาะส่วน crop=(x1, y1, x2, y2) ในการแปลงภาพครั้งเดียว
+    (แทนการ resize ทั้งภาพ แล้ว warpAffine ซ้ำอีกรอบ)
+    """
+    cx1, cy1, cx2, cy2 = crop
+    if angle == 0.0:
+        return cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)[cy1:cy2, cx1:cx2]
+
+    sx = size / float(img.shape[1])
+    sy = size / float(img.shape[0])
+    rot = cv2.getRotationMatrix2D((size / 2.0, size / 2.0), angle, 1.0)
+
+    # เมื่อย่อภาพ ให้ resize ก่อนแล้วค่อยหมุน เพื่อไม่ให้ลายเส้นบางๆ แตกเป็นหยัก (Aliasing) จากการสุ่มพิกเซลข้ามช่วง
+    if sx < 1.0 or sy < 1.0:
+        rot[0, 2] -= cx1
+        rot[1, 2] -= cy1
+        small = cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)
+        return cv2.warpAffine(small, rot, (cx2 - cx1, cy2 - cy1), flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+
+    m = np.empty((2, 3), dtype=np.float64)
+    m[:, 0] = rot[:, 0] * sx
+    m[:, 1] = rot[:, 1] * sy
+    m[:, 2] = rot[:, 0] * (0.5 * sx - 0.5) + rot[:, 1] * (0.5 * sy - 0.5) + rot[:, 2]
+    m[0, 2] -= cx1
+    m[1, 2] -= cy1
+    return cv2.warpAffine(img, m, (cx2 - cx1, cy2 - cy1), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+
+
+def _blit_additive(frame, img, x1, y1, size, gain, angle=0.0, max_w=None, max_h=None):
+    """เบลนด์สไปรต์แบบ Additive ลงบนเฟรม โดยมุมซ้ายบนของสไปรต์อยู่ที่ (x1, y1)"""
+    if img is None or size <= 0 or gain <= 0.0:
+        return
+
+    fh, fw = frame.shape[:2]
+    dx1 = max(0, x1)
+    dy1 = max(0, y1)
+    dx2 = min(fw if max_w is None else max_w, x1 + size)
+    dy2 = min(fh if max_h is None else max_h, y1 + size)
+    if dx2 <= dx1 or dy2 <= dy1:
+        return
+
+    crop = (dx1 - x1, dy1 - y1, dx2 - x1, dy2 - y1)
+    glow = _warp_sprite(_get_premultiplied(img), size, angle, crop)
+    roi = frame[dy1:dy2, dx1:dx2]
+    cv2.addWeighted(roi, 1.0, glow, float(gain), 0.0, dst=roi)
+
+
+# ==============================================================================
 # 1. ระบบอนุภาคและเอฟเฟกต์ย่อย (Particle & Secondary VFX Classes)
 # ==============================================================================
 
@@ -203,37 +274,12 @@ class RisingHeart:
     def draw(self, frame, w_limit=None, h_limit=None):
         progress = self.timer / self.duration
         if progress < 1.0 and self.img is not None:
-            fh, fw = frame.shape[:2]
-            max_w = w_limit if w_limit is not None else fw
-            max_h = h_limit if h_limit is not None else fh
-
             cur_size = int(self.size * (1.0 - progress * 0.2))
             x1 = int(self.x) - cur_size // 2
             y1 = int(self.y) - cur_size // 2
-            x2 = x1 + cur_size
-            y2 = y1 + cur_size
 
-            dx1 = max(0, x1)
-            dy1 = max(0, y1)
-            dx2 = min(max_w, x2)
-            dy2 = min(max_h, y2)
-
-            if dx2 > dx1 and dy2 > dy1:
-                resized = cv2.resize(self.img, (cur_size, cur_size), interpolation=cv2.INTER_LINEAR)
-                cx1 = dx1 - x1
-                cy1 = dy1 - y1
-                cx2 = cx1 + (dx2 - dx1)
-                cy2 = cy1 + (dy2 - dy1)
-
-                cropped = resized[cy1:cy2, cx1:cx2]
-                roi = frame[dy1:dy2, dx1:dx2]
-
-                bgr = cropped[:, :, :3]
-                alpha = cropped[:, :, 3]
-                fade = math.sin(progress * math.pi)
-                alpha_3ch = cv2.merge([alpha, alpha, alpha])
-                weighted = cv2.multiply(bgr, alpha_3ch, scale=(fade * 1.4) / 255.0, dtype=cv2.CV_8U)
-                cv2.add(roi, weighted, dst=roi)
+            fade = math.sin(progress * math.pi)
+            _blit_additive(frame, self.img, x1, y1, cur_size, fade * 1.4, max_w=w_limit, max_h=h_limit)
 
 
 class SmokePuff:
@@ -309,37 +355,12 @@ class SpriteBurst:
     def draw(self, frame, w_limit=None, h_limit=None):
         progress = self.timer / self.duration
         if progress < 1.0 and self.img is not None:
-            fh, fw = frame.shape[:2]
-            max_w = w_limit if w_limit is not None else fw
-            max_h = h_limit if h_limit is not None else fh
-
             cur_size = int(self.start_size + (self.end_size - self.start_size) * progress)
             x1 = self.x - cur_size // 2
             y1 = self.y - cur_size // 2
-            x2 = x1 + cur_size
-            y2 = y1 + cur_size
 
-            draw_x1 = max(0, x1)
-            draw_y1 = max(0, y1)
-            draw_x2 = min(max_w, x2)
-            draw_y2 = min(max_h, y2)
-
-            if draw_x2 > draw_x1 and draw_y2 > draw_y1:
-                resized = cv2.resize(self.img, (cur_size, cur_size), interpolation=cv2.INTER_LINEAR)
-                crop_x1 = draw_x1 - x1
-                crop_y1 = draw_y1 - y1
-                crop_x2 = crop_x1 + (draw_x2 - draw_x1)
-                crop_y2 = crop_y1 + (draw_y2 - draw_y1)
-
-                cropped = resized[crop_y1:crop_y2, crop_x1:crop_x2]
-                roi = frame[draw_y1:draw_y2, draw_x1:draw_x2]
-
-                bgr = cropped[:, :, :3]
-                alpha = cropped[:, :, 3]
-                fade = max(0.0, 1.0 - progress)
-                alpha_3ch = cv2.merge([alpha, alpha, alpha])
-                weighted = cv2.multiply(bgr, alpha_3ch, scale=(fade * 1.5) / 255.0, dtype=cv2.CV_8U)
-                cv2.add(roi, weighted, dst=roi)
+            fade = max(0.0, 1.0 - progress)
+            _blit_additive(frame, self.img, x1, y1, cur_size, fade * 1.5, max_w=w_limit, max_h=h_limit)
 
 
 class InwardManaParticle:
@@ -468,6 +489,8 @@ class UIRenderer:
         "Hollow Purple": (220, 40, 200)
     }
 
+    EMIT_INTERVAL = 1.0 / 30.0
+
     def __init__(self, frame_width=1280, frame_height=720):
         self.w = frame_width
         self.h = frame_height
@@ -484,6 +507,10 @@ class UIRenderer:
         self.mana_particles = []
         self.shockwaves = []
         self.awakened_banners = []
+
+        # ตัวจับจังหวะปล่อยอนุภาคต่อเนื่อง: ล็อกไว้ที่ 30 ครั้ง/วินาที ไม่ให้แปรผันตาม FPS ของการเรนเดอร์
+        self.emit_tick = True
+        self._emit_accum = 0.0
 
         self.assets_dir = get_resource_path("assets")
         os.makedirs(self.assets_dir, exist_ok=True)
@@ -1029,41 +1056,8 @@ class UIRenderer:
             return
 
         r = size // 2
-        x1, y1 = cx - r, cy - r
-        x2, y2 = x1 + size, y1 + size
-
-        dx1 = max(0, x1)
-        dy1 = max(0, y1)
-        dx2 = min(self.w, x2)
-        dy2 = min(self.h, y2)
-
-        if dx2 <= dx1 or dy2 <= dy1:
-            return
-
-        resized = cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)
-        if angle != 0.0:
-            M = cv2.getRotationMatrix2D((size / 2.0, size / 2.0), angle, 1.0)
-            resized = cv2.warpAffine(resized, M, (size, size), flags=cv2.INTER_LINEAR,
-                                     borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
-
-        cx1 = dx1 - x1
-        cy1 = dy1 - y1
-        cx2 = cx1 + (dx2 - dx1)
-        cy2 = cy1 + (dy2 - dy1)
-
-        cropped = resized[cy1:cy2, cx1:cx2]
-        roi = frame[dy1:dy2, dx1:dx2]
-
-        bgr = cropped[:, :, :3]
-        if cropped.shape[2] == 4:
-            alpha = cropped[:, :, 3]
-            alpha_3ch = cv2.merge([alpha, alpha, alpha])
-        else:
-            alpha_3ch = np.full_like(bgr, 255)
-
-        scale = (float(alpha_mult) * 1.4) / 255.0
-        weighted_bgr = cv2.multiply(bgr, alpha_3ch, scale=scale, dtype=cv2.CV_8U)
-        cv2.add(roi, weighted_bgr, dst=roi)
+        _blit_additive(frame, img, cx - r, cy - r, size, float(alpha_mult) * 1.4, angle=angle,
+                       max_w=self.w, max_h=self.h)
 
     def _draw_normal_sprite(self, frame, img, cx, cy, size, angle=0.0, alpha_mult=1.0):
         """เบลนด์ภาพแบบ Standard Alpha Blending สำหรับวัตถุทึบแสง เช่น ก้อนหิน"""
@@ -1082,26 +1076,18 @@ class UIRenderer:
         if dx2 <= dx1 or dy2 <= dy1:
             return
 
-        resized = cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)
-        if angle != 0.0:
-            M = cv2.getRotationMatrix2D((size / 2.0, size / 2.0), angle, 1.0)
-            resized = cv2.warpAffine(resized, M, (size, size), flags=cv2.INTER_LINEAR,
-                                     borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
-
-        cx1 = dx1 - x1
-        cy1 = dy1 - y1
-        cx2 = cx1 + (dx2 - dx1)
-        cy2 = cy1 + (dy2 - dy1)
-
-        cropped = resized[cy1:cy2, cx1:cx2]
+        cropped = _warp_sprite(img, size, angle, (dx1 - x1, dy1 - y1, dx2 - x1, dy2 - y1))
         roi = frame[dy1:dy2, dx1:dx2]
 
         bgr = cropped[:, :, :3]
         if cropped.shape[2] == 4:
-            alpha = (cropped[:, :, 3].astype(np.float32) / 255.0) * min(1.0, float(alpha_mult))
-            a3 = alpha[:, :, np.newaxis]
-            blended = (bgr.astype(np.float32) * a3 + roi.astype(np.float32) * (1.0 - a3)).astype(np.uint8)
-            roi[:] = blended
+            alpha_3ch = cv2.cvtColor(cropped[:, :, 3], cv2.COLOR_GRAY2BGR)
+            opacity = min(1.0, float(alpha_mult))
+            if opacity < 1.0:
+                alpha_3ch = cv2.convertScaleAbs(alpha_3ch, alpha=opacity)
+            fg = cv2.multiply(bgr, alpha_3ch, scale=1.0 / 255.0, dtype=cv2.CV_8U)
+            bg = cv2.multiply(roi, cv2.bitwise_not(alpha_3ch), scale=1.0 / 255.0, dtype=cv2.CV_8U)
+            cv2.add(fg, bg, dst=roi)
         else:
             cv2.addWeighted(bgr, alpha_mult, roi, 1.0 - alpha_mult, 0, roi)
 
@@ -1158,7 +1144,7 @@ class UIRenderer:
         cv2.putText(frame, txt, (tx, ty), font, scale, theme_color, thick, cv2.LINE_AA)
 
     def draw_fireball_charging(self, frame, cx, cy, ratio, remaining, now):
-        if np.random.rand() > 0.25:
+        if self._emit_roll(0.25):
             self.inward_embers.append(InwardEmber(cx, cy))
 
         seal_img = self.images.get("vfx_charge_seal")
@@ -1222,7 +1208,7 @@ class UIRenderer:
         self.draw_charging_timer_badge(frame, "Magic Shield", cx, cy, ratio, remaining)
 
     def draw_lightning_charging(self, frame, cx, cy, ratio, remaining, now):
-        if np.random.rand() > 0.20:
+        if self._emit_roll(0.20):
             self.electric_particles.append(ElectricArcParticle(cx, cy))
 
         seal_img = self.images.get("vfx_charge_seal")
@@ -1255,7 +1241,7 @@ class UIRenderer:
         self.draw_charging_timer_badge(frame, "Lightning Strike", cx, cy, ratio, remaining)
 
     def draw_terra_charging(self, frame, cx, cy, ratio, remaining, now):
-        if np.random.rand() > 0.35:
+        if self._emit_roll(0.35):
             self.rock_shards.append(RockShard(cx, cy, np.random.uniform(-1, 1), np.random.uniform(-1, 1)))
 
         dust_img = self.images.get("vfx_charge_terra_dust_ring")
@@ -1282,7 +1268,7 @@ class UIRenderer:
         self.draw_charging_timer_badge(frame, "Terra Boulder", cx, cy, ratio, remaining)
 
     def draw_healing_charging(self, frame, cx, cy, ratio, remaining, now):
-        if np.random.rand() > 0.25:
+        if self._emit_roll(0.25):
             p = Particle(cx + np.random.uniform(-25, 25), cy + np.random.uniform(-15, 15),
                          (90, 255, 120) if np.random.rand() > 0.3 else (150, 255, 210),
                          speed_range=(40, 120), life_range=(0.3, 0.6), radius_range=(2, 4))
@@ -1405,7 +1391,7 @@ class UIRenderer:
             if "vfx_hp_flare" in self.images:
                 self._draw_additive_sprite(frame, self.images["vfx_hp_flare"], blue_x, blue_y, int(size_blue * 0.55), angle=now * 80.0, alpha_mult=1.5)
 
-            if np.random.rand() > 0.40:
+            if self._emit_roll(0.40):
                 self.particles.append(Particle(red_x, red_y, (30, 80, 255), speed_range=(35, 95), life_range=(0.3, 0.5), radius_range=(3, 6)))
                 self.particles.append(Particle(blue_x, blue_y, (255, 180, 40), speed_range=(35, 95), life_range=(0.3, 0.5), radius_range=(3, 6)))
 
@@ -1441,7 +1427,7 @@ class UIRenderer:
         elif elapsed < 8.20:
             stage_prog = (elapsed - 6.20) / 2.00
 
-            if stage_prog < 0.20 and np.random.rand() > 0.35:
+            if stage_prog < 0.20 and self._emit_roll(0.35):
                 self.shockwaves.append(Shockwave(cx, cy, (230, 50, 220), max_radius=260, duration=0.45))
 
             base_sz = int(320 + 120 * stage_prog)
@@ -1463,7 +1449,7 @@ class UIRenderer:
 
             self._draw_crackling_purple_lightning(frame, cx, cy, purple_sz // 2, now, count=2)
 
-            if np.random.rand() > 0.30:
+            if self._emit_roll(0.30):
                 self.particles.append(Particle(cx, cy, (230, 50, 220), speed_range=(100, 320), life_range=(0.3, 0.55), radius_range=(4, 8)))
 
         # ระยะที่ 4: พลังงานเสถียรสมบูรณ์พร้อมยิง
@@ -1519,7 +1505,7 @@ class UIRenderer:
 
         self._draw_crackling_purple_lightning(frame, ix, iy, core_sz // 2, now, count=3)
 
-        if np.random.rand() > 0.20:
+        if self._emit_roll(0.20):
             self.particles.append(Particle(ix, iy, (240, 70, 230), speed_range=(60, 180), life_range=(0.20, 0.45), radius_range=(3, 8)))
             self.particles.append(Particle(ix, iy, (255, 240, 255), speed_range=(40, 110), life_range=(0.15, 0.35), radius_range=(2, 5)))
 
@@ -1708,10 +1694,10 @@ class UIRenderer:
         tail_back_x = px - dir_x * 85
         tail_back_y = py - dir_y * 85
 
-        if np.random.rand() > 0.35 and "vfx_fire_smoke" in self.images:
+        if self._emit_roll(0.35) and "vfx_fire_smoke" in self.images:
             self.smoke_puffs.append(SmokePuff(self.images["vfx_fire_smoke"], tail_back_x, tail_back_y, size=75, duration=0.45))
 
-        if np.random.rand() > 0.2:
+        if self._emit_roll(0.2):
             self.ember_sparks.append(EmberSpark(tail_back_x, tail_back_y))
 
         if "vfx_fire_tail" in self.images:
@@ -1746,7 +1732,7 @@ class UIRenderer:
         px, py = int(x), int(y)
         angle = math.degrees(math.atan2(-vy, vx))
 
-        if np.random.rand() > 0.15:
+        if self._emit_roll(0.15):
             self.electric_particles.append(ElectricArcParticle(px, py))
 
         if "vfx_lightning_spark" in self.images and np.random.rand() > 0.25:
@@ -1783,12 +1769,12 @@ class UIRenderer:
         tail_x = px - dir_x * (size * 0.35)
         tail_y = py - dir_y * (size * 0.35)
 
-        if np.random.rand() > 0.15:
+        if self._emit_roll(0.15):
             for _ in range(np.random.randint(1, 3)):
                 self.rock_shards.append(RockShard(tail_x, tail_y, dir_x, dir_y))
 
         dust_img = self.images.get("vfx_terra_dust", self.images.get("vfx_fireball_smoke"))
-        if np.random.rand() > 0.40 and dust_img is not None:
+        if self._emit_roll(0.40) and dust_img is not None:
             self.smoke_puffs.append(SmokePuff(dust_img, tail_x, tail_y, size=48, duration=0.32))
 
         cv2.circle(frame, (px, py), int(size * 0.32), (32, 40, 48), -1, cv2.LINE_AA)
@@ -1831,8 +1817,17 @@ class UIRenderer:
         for _ in range(count):
             self.mana_particles.append(InwardManaParticle(hand_x, hand_y))
 
+    def _emit_roll(self, threshold):
+        """สุ่มปล่อยอนุภาคต่อเนื่อง เฉพาะเฟรมที่ถึงจังหวะปล่อย (emit_tick) เท่านั้น"""
+        return self.emit_tick and np.random.rand() > threshold
+
     def update_vfx(self, dt):
         """อัปเดตสถานะและอายุขัยของอนุภาคทั้งหมดตามเวลาจริง (Delta Time)"""
+        self._emit_accum += dt
+        self.emit_tick = self._emit_accum >= self.EMIT_INTERVAL
+        if self.emit_tick:
+            self._emit_accum = min(self._emit_accum - self.EMIT_INTERVAL, self.EMIT_INTERVAL)
+
         for p in list(self.particles):
             p.update(dt)
             if p.life <= 0:

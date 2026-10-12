@@ -21,6 +21,7 @@ from spell_system import SpellConfig, PlayerCombatState
 from ui_renderer import UIRenderer
 from sound_manager import SoundManager
 from resource_helper import get_resource_path, get_base_dir
+from vision_pipeline import CameraStream, VisionWorker, enable_high_res_timer
 
 
 # ==============================================================================
@@ -78,16 +79,37 @@ def load_title_logo():
     return None
 
 
+title_logo_cache = {}
+
 def draw_magic_title_graphic(frame, logo_img, center_x, top_y=55, target_width=800):
     """เรนเดอร์ภาพโลโก้ไตเติลเกมลงบนเฟรมพร้อมการจัดสเกลอัตราส่วนภาพ"""
     if logo_img is None:
         return False
 
-    orig_h, orig_w = logo_img.shape[:2]
-    aspect_ratio = orig_h / orig_w
-    target_height = int(target_width * aspect_ratio)
+    # ย่อภาพและคำนวณ Alpha ล่วงหน้าเพียงครั้งเดียว (Premultiplied) แล้วเก็บแคชไว้ใช้ทุกเฟรม
+    cached = title_logo_cache.get(target_width)
+    if cached is None:
+        orig_h, orig_w = logo_img.shape[:2]
+        target_height = int(target_width * (orig_h / orig_w))
+        resized = cv2.resize(logo_img, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
-    resized = cv2.resize(logo_img, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        if resized.shape[2] == 4:
+            alpha = resized[:, :, 3].astype(np.float32) / 255.0
+            bgr = resized[:, :, :3].astype(np.float32)
+        else:
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            alpha = np.clip(gray.astype(np.float32) / 190.0, 0.0, 1.0)
+            alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
+            bgr = resized.astype(np.float32)
+
+        alpha = np.expand_dims(alpha, axis=2)
+        premult = np.clip(bgr * alpha, 0, 255).astype(np.uint8)
+        inv_alpha = np.repeat(np.clip((1.0 - alpha) * 255.0, 0, 255).astype(np.uint8), 3, axis=2)
+        cached = (premult, inv_alpha)
+        title_logo_cache[target_width] = cached
+
+    premult, inv_alpha = cached
+    target_height = premult.shape[0]
 
     x1 = center_x - target_width // 2
     y1 = top_y
@@ -98,22 +120,8 @@ def draw_magic_title_graphic(frame, logo_img, center_x, top_y=55, target_width=8
         return False
 
     roi = frame[y1:y2, x1:x2]
-
-    if resized.shape[2] == 4:
-        alpha = resized[:, :, 3].astype(np.float32) / 255.0
-        alpha = np.expand_dims(alpha, axis=2)
-        bgr = resized[:, :, :3].astype(np.float32)
-        blended = (1.0 - alpha) * roi.astype(np.float32) + alpha * bgr
-        frame[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
-    else:
-        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-        alpha = np.clip(gray.astype(np.float32) / 190.0, 0.0, 1.0)
-        alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
-        alpha = np.expand_dims(alpha, axis=2)
-
-        bgr = resized.astype(np.float32)
-        blended = (1.0 - alpha) * roi.astype(np.float32) + alpha * bgr
-        frame[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
+    cv2.multiply(roi, inv_alpha, dst=roi, scale=1.0 / 255.0)
+    cv2.add(roi, premult, dst=roi)
 
     return True
 
@@ -211,6 +219,19 @@ def overlay_sprite(frame, sprite, x, y):
 
     blended = roi * (1.0 - alpha) + bgr * alpha
     frame[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
+
+
+def dim_region(frame, x1, y1, x2, y2, color, opacity):
+    """ถมกล่องสีโปร่งแสงเฉพาะบริเวณที่กำหนด (รวมขอบ x2, y2) โดยไม่ต้องคัดลอกและเบลนด์ทั้งเฟรม"""
+    fh, fw = frame.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(fw, x2 + 1), min(fh, y2 + 1)
+    if x1 >= x2 or y1 >= y2:
+        return
+    roi = frame[y1:y2, x1:x2]
+    tint = np.empty_like(roi)
+    tint[:] = color
+    cv2.addWeighted(tint, opacity, roi, 1.0 - opacity, 0, dst=roi)
 
 
 def draw_title_gesture_prompt(frame, center_x, base_y=518):
@@ -388,6 +409,8 @@ class Projectile:
 class AirDrawSession:
     """ระบบตรวจจับการวาดเส้นกลางอากาศของผู้เล่น พร้อมการกรองสัญญาณสั่นไหว"""
 
+    REFERENCE_DT = 1.0 / 30.0
+
     def __init__(self):
         self.raw_points = []
         self.smoothed_pt = None
@@ -428,6 +451,9 @@ class AirDrawSession:
             else:
                 frame_dist = 10.0
             self.prev_tip = (self.smoothed_pt[0], self.smoothed_pt[1])
+
+            # ปรับระยะต่อการอัปเดตให้เทียบเท่าที่ 30 Hz เพื่อให้เกณฑ์ "หยุดนิ่ง" ไม่ขึ้นกับความเร็วของ AI
+            frame_dist *= self.REFERENCE_DT / max(1.0 / 120.0, min(0.1, dt))
 
             self.speed = 0.4 * frame_dist + 0.6 * self.speed
 
@@ -660,10 +686,11 @@ def draw_arcade_hud(frame, p1_state, p2_state, p1_wins, p2_wins, now):
 # 4. การกำหนดค่ากล้อง โมเดล AI และตัวแปรระบบ
 # ==============================================================================
 
-cap = cv2.VideoCapture(cfg.CAMERA_INDEX, cv2.CAP_DSHOW)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.FRAME_WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.FRAME_HEIGHT)
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+enable_high_res_timer()
+
+# กล้องและ AI ทำงานบนเธรดของตัวเอง ลูปหลักจึงเรนเดอร์ได้โดยไม่ต้องรอทั้งสองอย่าง
+camera = CameraStream(cfg.CAMERA_INDEX, cfg.FRAME_WIDTH, cfg.FRAME_HEIGHT,
+                      target_fps=cfg.CAMERA_FPS, fourcc=cfg.CAMERA_FOURCC)
 
 WINDOW_NAME = "Magic Spell Duel - Arcade Arena"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -672,15 +699,17 @@ is_fullscreen = True
 
 # ระบบประมวลผล MediaPipe
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=cfg.MAX_NUM_HANDS,
-    min_detection_confidence=cfg.HAND_MIN_DETECTION_CONF,
-    min_tracking_confidence=cfg.HAND_MIN_TRACKING_CONF
-)
-mp_face = mp.solutions.face_detection.FaceDetection(
-    model_selection=1, 
-    min_detection_confidence=cfg.FACE_MIN_DETECTION_CONF
+vision = VisionWorker(
+    camera,
+    max_num_hands=cfg.MAX_HANDS_PER_PLAYER,
+    hand_detection_conf=cfg.HAND_MIN_DETECTION_CONF,
+    hand_tracking_conf=cfg.HAND_MIN_TRACKING_CONF,
+    face_detection_conf=cfg.FACE_MIN_DETECTION_CONF,
+    hand_model_complexity=cfg.HAND_MODEL_COMPLEXITY,
+    face_every=cfg.FACE_DETECT_EVERY,
+    zoom_enabled=cfg.HAND_ZOOM_ENABLED,
+    zoom_face_scale=cfg.HAND_ZOOM_FACE_SCALE,
+    zoom_min_size=cfg.HAND_ZOOM_MIN_SIZE
 )
 
 # โมดูลระบบย่อย
@@ -735,9 +764,11 @@ p2_recharge_hold_timer = 0.0
 ko_slowmo_timer = 0.0
 ko_flash_alpha = 0.0
 
-# ตัวแปรจัดการ Throttling และตรวจวัดประสิทธิภาพ
-frame_counter = 0
-cached_face_results = None
+# ตัวแปรติดตามลำดับเฟรมกล้อง/ผลลัพธ์ AI และตรวจวัดประสิทธิภาพ
+cam_seq = 0
+last_ai_seq = 0
+render_interval = 1.0 / cfg.MIN_RENDER_FPS
+loop_start = time.perf_counter()
 
 prev_time = time.time()
 fps = 0.0
@@ -749,7 +780,7 @@ def start_new_round(reset_match=False):
     global round_over_timer, round_winner_text, match_winner_text, rematch_hold_duration
     global ko_slowmo_timer, ko_flash_alpha, shake_timer, shake_intensity, announcer_round_called
     global p1_last_title_ready_time, p2_last_title_ready_time, p1_last_rematch_ready_time, p2_last_rematch_ready_time
-    global p1_recharge_hold_timer, p2_recharge_hold_timer, frame_counter, cached_face_results
+    global p1_recharge_hold_timer, p2_recharge_hold_timer
 
     announcer_queue.clear()
 
@@ -835,8 +866,6 @@ def start_new_round(reset_match=False):
     ko_flash_alpha = 0.0
     shake_timer = 0.0
     shake_intensity = 0.0
-    frame_counter = 0
-    cached_face_results = None
 
 
 # ==============================================================================
@@ -845,10 +874,17 @@ def start_new_round(reset_match=False):
 
 print("[System] Magic Spell Duel - Engine Initialized Successfully")
 
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
+while camera.is_opened():
+    # รอเฟรมใหม่จากกล้องจนถึงเส้นตาย 1/MIN_RENDER_FPS นับจากต้นรอบก่อนหน้า หากกล้องส่งไม่ทันจะเรนเดอร์ซ้ำ
+    # บนเฟรมล่าสุด เพื่อให้เอฟเฟกต์และ HUD ยังลื่นไหลแม้กล้องส่งภาพได้ช้ากว่านั้น
+    wait_budget = render_interval - (time.perf_counter() - loop_start)
+    raw_frame, cam_seq = camera.wait_frame(cam_seq, max(0.0, wait_budget))
+    loop_start = time.perf_counter()
+    if raw_frame is None:
+        if cv2.waitKey(1) & 0xFF in [ord('q'), 27]:
+            break
         continue
+    frame = raw_frame.copy()
 
     now = time.time()
     raw_dt = now - prev_time
@@ -867,17 +903,11 @@ while cap.isOpened():
     update_announcer_queue(sound_engine, now)
 
     h, w, _ = frame.shape
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    # AI Downscale: ย่อภาพเหลือ 640x360 เฉพาะตอนส่งให้ AI เพื่อเพิ่ม FPS บนฮาร์ดแวร์สเปกต่ำ
-    ai_frame = cv2.resize(rgb_frame, (640, 360), interpolation=cv2.INTER_LINEAR)
-    hand_results = hands.process(ai_frame)
-
-    # Face Throttling: ประมวลผลใบหน้าทุกๆ 3 เฟรมเพื่อลดภาระ CPU
-    frame_counter += 1
-    if frame_counter % 3 == 0 or cached_face_results is None:
-        cached_face_results = mp_face.process(ai_frame)
-    face_results = cached_face_results
+    # ดึงผลลัพธ์ AI ล่าสุดจาก VisionWorker (ไม่บล็อกลูปเรนเดอร์)
+    hand_results, face_results, ai_seq, ai_dt = vision.latest()
+    hands_fresh = (ai_seq != last_ai_seq)
+    last_ai_seq = ai_seq
 
     center_x = w // 2
 
@@ -896,7 +926,7 @@ while cap.isOpened():
     # ตรวจจับและแยกแยะมือระหว่าง P1 (ซ้าย) และ P2 (ขวา)
     p1_cands = []
     p2_cands = []
-    if hand_results.multi_hand_landmarks:
+    if hand_results is not None and hand_results.multi_hand_landmarks:
         for hl in hand_results.multi_hand_landmarks:
             if hl.landmark[mp_hands.HandLandmark.WRIST].x < 0.5:
                 p1_cands.append(hl)
@@ -1048,12 +1078,14 @@ while cap.isOpened():
                 sound_engine.set_recharge_sound(tag, p_state.is_recharging)
 
                 if p_state.is_recharging:
-                    ui_engine.spawn_mana_recharge_fx(hand_center_px[0], hand_center_px[1], count=3)
+                    if ui_engine.emit_tick:
+                        ui_engine.spawn_mana_recharge_fx(hand_center_px[0], hand_center_px[1], count=3)
                     ui_engine.draw_mana_recharge(frame, hand_center_px[0], hand_center_px[1], now)
 
                 # อัปเดตการวาดเส้นและการจำแนกสัญลักษณ์
                 if p_state.state in ["IDLE", "RECOGNIZED"] and not p_state.infinity_barrier_active:
-                    drawn_stroke = p_draw.update(tip_px, g_key, dt, tag=tag, sound_engine=sound_engine)
+                    # อัปเดตลายเส้นเฉพาะเมื่อมีพิกัดมือชุดใหม่ ไม่เช่นนั้นตำแหน่งซ้ำจะถูกตีความว่านิ้วหยุดนิ่ง
+                    drawn_stroke = p_draw.update(tip_px, g_key, ai_dt, tag=tag, sound_engine=sound_engine) if hands_fresh else None
 
                     if p_state.state == "RECOGNIZED" and len(p_draw.raw_points) >= 3:
                         p_state.state = "IDLE"
@@ -1242,7 +1274,7 @@ while cap.isOpened():
                 trail_r = max(2, int(proj.radius * fade_alpha * 0.7))
                 cv2.circle(frame, (tx, ty), trail_r, proj.color, -1, cv2.LINE_AA)
 
-            if np.random.rand() > 0.4:
+            if ui_engine.emit_tick and np.random.rand() > 0.4:
                 ui_engine.spawn_trail_particle(int(proj.x), int(proj.y), proj.color)
 
             px, py = int(proj.x), int(proj.y)
@@ -1426,9 +1458,8 @@ while cap.isOpened():
 
     # การเรนเดอร์ตามสเตทแมชชีน (State Machine Rendering)
     if match_state == "TITLE":
-        title_overlay = frame.copy()
-        cv2.rectangle(title_overlay, (0, 0), (w, h), (8, 8, 14), -1)
-        cv2.addWeighted(title_overlay, 0.45, frame, 0.55, 0, frame)
+        # หรี่ภาพพื้นหลังลง 45% (เทียบเท่าการเบลนด์กับฉากสีเข้มทั้งจอ แต่ไม่ต้องคัดลอกเฟรม)
+        cv2.convertScaleAbs(frame, dst=frame, alpha=0.55, beta=4)
 
         rendered_logo = draw_magic_title_graphic(frame, title_logo_img, center_x, top_y=55, target_width=800)
 
@@ -1539,9 +1570,7 @@ while cap.isOpened():
 
     elif match_state == "ROUND_OVER":
         round_over_timer -= dt
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (center_x - 360, 290), (center_x + 360, 410), (15, 15, 15), -1)
-        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+        dim_region(frame, center_x - 360, 290, center_x + 360, 410, (15, 15, 15), 0.65)
 
         cv2.rectangle(frame, (center_x - 360, 290), (center_x + 360, 410), (0, 215, 255), 3)
         t_size = cv2.getTextSize(round_winner_text, cv2.FONT_HERSHEY_SIMPLEX, 1.05, 3)[0]
@@ -1555,9 +1584,7 @@ while cap.isOpened():
         box_x1, box_y1 = center_x - 440, 190
         box_x2, box_y2 = center_x + 440, 500
 
-        glass_overlay = frame.copy()
-        cv2.rectangle(glass_overlay, (box_x1, box_y1), (box_x2, box_y2), (10, 10, 15), -1)
-        cv2.addWeighted(glass_overlay, 0.58, frame, 0.42, 0, frame)
+        dim_region(frame, box_x1, box_y1, box_x2, box_y2, (10, 10, 15), 0.58)
 
         cv2.rectangle(frame, (box_x1, box_y1), (box_x2, box_y2), (0, 215, 255), 3, cv2.LINE_AA)
         cv2.rectangle(frame, (box_x1 + 4, box_y1 + 4), (box_x2 - 4, box_y2 - 4), (255, 255, 255), 1, cv2.LINE_AA)
@@ -1611,13 +1638,14 @@ while cap.isOpened():
             start_new_round(reset_match=True)
 
     if ko_flash_alpha > 0.0:
-        white_screen = np.full_like(frame, 255)
-        cv2.addWeighted(white_screen, ko_flash_alpha, frame, 1.0 - ko_flash_alpha, 0, frame)
+        cv2.convertScaleAbs(frame, dst=frame, alpha=1.0 - ko_flash_alpha, beta=255.0 * ko_flash_alpha)
         ko_flash_alpha = max(0.0, ko_flash_alpha - raw_dt * 2.5)
 
     frame = apply_screen_shake(frame, raw_dt)
 
-    cv2.putText(frame, f"FPS: {fps:.1f}", (center_x - 38, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+    fps_txt = f"FPS {fps:.0f} | CAM {camera.fps:.0f} | AI {vision.fps:.0f}"
+    fps_w = cv2.getTextSize(fps_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 2)[0][0]
+    cv2.putText(frame, fps_txt, (center_x - fps_w // 2, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
 
     cv2.imshow(WINDOW_NAME, frame)
 
@@ -1647,7 +1675,6 @@ while cap.isOpened():
         ui_engine.spawn_awakened_banner(center_x, h // 2 - 35, text="★ DEV: BOTH AWAKENED! (∞)", is_dual=True, duration=3.0)
 
 # คืนทรัพยากรเมื่อปิดโปรแกรม
-cap.release()
+vision.close()
+camera.release()
 cv2.destroyAllWindows()
-hands.close()
-mp_face.close()
